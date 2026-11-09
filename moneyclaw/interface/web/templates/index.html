@@ -60,6 +60,10 @@
                     <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span> SYSTEM ONLINE</span>
                     <span class="text-cyan-800">|</span>
                     <span id="tick-counter">Tick #0</span>
+                    {% if dry_run %}
+                    <span class="text-cyan-800">|</span>
+                    <span class="px-2 py-0.5 rounded border border-yellow-500/60 text-yellow-400">DRY RUN</span>
+                    {% endif %}
                 </div>
             </div>
 

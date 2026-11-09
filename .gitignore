@@ -9,7 +9,7 @@ build/
 
 .env
 .env.local
-data/
+/data/
 *.db
 *.db-journal
 

@@ -66,11 +66,16 @@ class SmartRebalance(Strategy):
         """Fetch real portfolio balances from the connected exchange."""
         if not self._exchange_manager:
             return
-        # Skip if exchange is not connected (e.g., dry-run mode)
-        if self._exchange_id not in self._exchange_manager.connected:
-            return
         try:
             balance = await self._exchange_manager.get_balance(self._exchange_id)
+        except ValueError:
+            # Exchange not connected (e.g., dry-run mode) — keep existing holdings
+            log.debug("smart_rebalance.exchange_not_connected", exchange=self._exchange_id)
+            return
+        except Exception:
+            log.exception("smart_rebalance.refresh_holdings_error")
+            return
+        try:
             total_info = balance.get("total", {})
             # Convert to USD-value holdings keyed by target symbols
             holdings: dict[str, float] = {}

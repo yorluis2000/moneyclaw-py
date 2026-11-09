@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,7 +62,8 @@ def create_app(
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request):
-        return templates.TemplateResponse("index.html", {"request": request})
+        dry_run = bool(risk.status().get("dry_run", True))
+        return templates.TemplateResponse(request, "index.html", {"dry_run": dry_run})
 
     # --- API Endpoints (JSON) ---
 
@@ -134,14 +136,18 @@ def create_app(
         return {"status": "resumed"}
 
     @app.post("/api/approve/{opp_id}")
-    async def api_approve(opp_id: str) -> dict:
+    async def api_approve(opp_id: str) -> HTMLResponse:
         ok = await memory.approve(opp_id)
-        return {"status": "approved" if ok else "not_found"}
+        if ok:
+            return HTMLResponse('<span class="text-green-400">Approved</span>')
+        return HTMLResponse('<span class="text-red-400">Not found</span>', status_code=404)
 
     @app.post("/api/reject/{opp_id}")
-    async def api_reject(opp_id: str) -> dict:
+    async def api_reject(opp_id: str) -> HTMLResponse:
         ok = await memory.reject(opp_id)
-        return {"status": "rejected" if ok else "not_found"}
+        if ok:
+            return HTMLResponse('<span class="text-gray-400">Rejected</span>')
+        return HTMLResponse('<span class="text-red-400">Not found</span>', status_code=404)
 
     # --- Chat API ---
 
@@ -402,8 +408,62 @@ def create_app(
             "success": True
         }
 
-    # --- HTMX Partials (Legacy/Fallback) ---
-    # Keeping minimal HTMX partials if needed, or removing them if fully switching to JS.
-    # For now, let's keep the API endpoints clean and assume the JS frontend uses them.
+    # --- HTMX Partials ---
+
+    @app.get("/htmx/cards", response_class=HTMLResponse)
+    async def htmx_cards() -> str:
+        status = await brain.get_status()
+        pnl_val = status["today_pnl"]
+        pnl_color = "text-green-400" if pnl_val >= 0 else "text-red-400"
+        pnl_sign = "+" if pnl_val >= 0 else ""
+        order_count = len(executor.order_history) if executor else 0
+        return f"""
+  <div class="bg-gray-800 p-4 rounded">
+    <div class="text-sm text-gray-400">Status</div>
+    <div class="text-xl">{"🟢 Running" if status["running"] else "🔴 Stopped"}</div>
+  </div>
+  <div class="bg-gray-800 p-4 rounded">
+    <div class="text-sm text-gray-400">Today P&L</div>
+    <div class="text-xl {pnl_color}">{pnl_sign}${pnl_val:.2f}</div>
+  </div>
+  <div class="bg-gray-800 p-4 rounded">
+    <div class="text-sm text-gray-400">Strategies</div>
+    <div class="text-xl">{status["strategies_active"]} active</div>
+  </div>
+  <div class="bg-gray-800 p-4 rounded">
+    <div class="text-sm text-gray-400">Orders</div>
+    <div class="text-xl">{order_count}</div>
+  </div>"""
+
+    @app.get("/htmx/history", response_class=HTMLResponse)
+    async def htmx_history() -> str:
+        history = await memory.get_history(limit=10)
+        rows = ""
+        for h in history:
+            pnl = h["profit_loss"]
+            color = "text-green-400" if pnl >= 0 else "text-red-400"
+            sign = "+" if pnl >= 0 else ""
+            ts = datetime.fromtimestamp(h["executed_at"], tz=UTC).strftime("%m-%d %H:%M")
+            title = html.escape(str(h["title"])[:50])
+            rows += (
+                f'<tr class="border-b border-gray-700">'
+                f'<td class="py-2 px-3 text-gray-400">{ts}</td>'
+                f'<td class="py-2 px-3">{html.escape(str(h["strategy"]))}</td>'
+                f'<td class="py-2 px-3">{title}</td>'
+                f'<td class="py-2 px-3 {color}">{sign}${pnl:.2f}</td>'
+                f"</tr>"
+            )
+        empty = '<tr><td colspan="4" class="py-4 text-center text-gray-500">No trades yet</td></tr>'
+        return f"""
+  <div class="text-sm text-gray-400 mb-2">Recent Trades</div>
+  <table class="w-full text-sm">
+    <thead><tr class="text-gray-400 border-b border-gray-600">
+      <th class="py-2 px-3 text-left">Time</th>
+      <th class="py-2 px-3 text-left">Strategy</th>
+      <th class="py-2 px-3 text-left">Title</th>
+      <th class="py-2 px-3 text-left">P&L</th>
+    </tr></thead>
+    <tbody>{rows or empty}</tbody>
+  </table>"""
 
     return app
