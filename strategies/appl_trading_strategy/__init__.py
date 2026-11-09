@@ -1,538 +1,169 @@
-```python
-"""
-APPL做T交易策略
-监控苹果公司(AAPL)股票，通过日内波段交易获取收益
+"""AAPL swing-trading signals (APPL做T交易策略).
+
+Watches Apple (AAPL) and flags buy-low / sell-high moments using RSI and Bollinger
+bands on recent daily bars. Advisory only: it keeps a paper position to decide when
+a sell signal applies, and never places real orders.
 """
 
-import asyncio
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
-from decimal import Decimal
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import Any
 
 import structlog
-import pandas as pd
-import numpy as np
-from moneyclaw.plugins.base import Opportunity, Result, Score, Strategy
+
+from moneyclaw.data.feeds.stocks import StockFeed
+from moneyclaw.data.indicators import bollinger, rsi
+from moneyclaw.plugins.base import Opportunity, Result, Score, Strategy, load_strategy_config
 
 log = structlog.get_logger()
 
+DEFAULT_CONFIG: dict[str, Any] = {
+    "symbol": "AAPL",
+    "base_amount": 1000.0,
+    "max_position": 5000.0,
+    "min_profit_percent": 0.005,
+    "max_loss_percent": 0.02,
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "bollinger_period": 20,
+    "bollinger_std": 2,
+    "max_daily_trades": 5,
+    "cooling_period": 300,  # seconds between signals
+    "lookback_days": 90,
+}
+
 
 class ApplTradingStrategy(Strategy):
-    """APPL做T交易策略
-    
-    监控苹果公司(AAPL)股票，通过日内波段交易获取收益。
-    策略原理：
-    1. 监控AAPL的日内价格波动
-    2. 在支撑位附近买入，在阻力位附近卖出
-    3. 设置严格的止损止盈
-    4. 控制仓位，避免过度交易
-    """
-    
-    # 类属性
-    name: str = "appl_trading"
-    description: str = "APPL做T策略 - 监控苹果公司股票进行日内波段交易"
-    risk_level: str = "medium"  # 中等风险
-    min_llm_layer: int = 3  # 需要中等复杂度的LLM支持
-    
-    # 默认配置参数
-    DEFAULT_CONFIG = {
-        # 交易参数
-        "symbol": "AAPL",  # 交易标的
-        "base_amount": 1000.0,  # 基础交易金额（美元）
-        "max_position": 5000.0,  # 最大持仓金额
-        "min_profit_percent": 0.005,  # 最小盈利百分比（0.5%）
-        "max_loss_percent": 0.02,  # 最大亏损百分比（2%）
-        
-        # 技术参数
-        "rsi_period": 14,  # RSI计算周期
-        "rsi_oversold": 30,  # RSI超卖阈值
-        "rsi_overbought": 70,  # RSI超买阈值
-        "bollinger_period": 20,  # 布林带周期
-        "bollinger_std": 2,  # 布林带标准差
-        
-        # 风控参数
-        "max_daily_trades": 5,  # 每日最大交易次数
-        "cooling_period": 300,  # 冷却时间（秒）
-        "slippage_tolerance": 0.001,  # 滑点容忍度（0.1%）
-        
-        # 时间参数
-        "market_open_hour": 9,  # 市场开盘时间（美东时间）
-        "market_close_hour": 16,  # 市场收盘时间（美东时间）
-        "pre_market_start": 4,  # 盘前交易开始时间
-        "after_market_end": 20,  # 盘后交易结束时间
-    }
-    
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """初始化策略
-        
-        Args:
-            config: 策略配置字典，会覆盖默认配置
-        """
-        super().__init__()
-        
-        # 合并配置
-        self.config = self.DEFAULT_CONFIG.copy()
-        if config:
-            self.config.update(config)
-        
-        # 状态变量
-        self.initialized: bool = False
-        self.today_trades: int = 0
-        self.current_position: float = 0.0
-        self.last_trade_time: Optional[datetime] = None
-        self.daily_pnl: float = 0.0
-        
-        # 数据缓存
-        self.price_history: List[Dict[str, Any]] = []
-        self.signals: List[Dict[str, Any]] = []
-        
-        # 连接对象（模拟）
-        self.market_data_conn = None
-        self.trading_conn = None
-        
-        log.info("strategy.initialized", 
-                strategy_name=self.name,
-                config=self.config)
-    
-    async def setup(self) -> None:
-        """初始化策略，建立连接
-        
-        建立市场数据连接和交易连接
-        加载历史数据
-        初始化技术指标
-        """
-        try:
-            log.info("strategy.setup.start")
-            
-            # 模拟建立市场数据连接
-            self.market_data_conn = {
-                "status": "connected",
-                "symbol": self.config["symbol"],
-                "connected_at": datetime.now()
-            }
-            
-            # 模拟建立交易连接
-            self.trading_conn = {
-                "status": "connected",
-                "account_id": "simulated_account",
-                "balance": 10000.0
-            }
-            
-            # 加载历史数据（模拟）
-            await self._load_historical_data()
-            
-            # 重置每日计数器
-            self._reset_daily_counters()
-            
-            self.initialized = True
-            log.info("strategy.setup.complete", 
-                    connections=["market_data", "trading"])
-            
-        except Exception as e:
-            log.error("strategy.setup.failed", error=str(e))
-            raise
-    
-    async def scan(self) -> List[Opportunity]:
-        """扫描市场，发现交易机会
-        
-        扫描AAPL的实时价格和技术指标
-        识别买入和卖出信号
-        生成交易机会
-        
-        Returns:
-            交易机会列表
-        """
-        if not self.initialized:
-            log.warning("strategy.not_initialized")
-            return []
-        
-        try:
-            log.info("strategy.scan.start")
-            
-            # 检查市场时间
-            if not self._is_market_open():
-                log.info("market.closed", time=datetime.now())
-                return []
-            
-            # 检查冷却时间
-            if not self._check_cooling_period():
-                log.info("in.cooling.period", 
-                        last_trade=self.last_trade_time)
-                return []
-            
-            # 检查每日交易限制
-            if self.today_trades >= self.config["max_daily_trades"]:
-                log.warning("daily.trade.limit.reached", 
-                          trades=self.today_trades)
-                return []
-            
-            # 获取实时数据（模拟）
-            current_data = await self._get_current_market_data()
-            if not current_data:
-                log.warning("no.market.data")
-                return []
-            
-            # 更新价格历史
-            self.price_history.append(current_data)
-            if len(self.price_history) > 100:  # 保持最近100条数据
-                self.price_history = self.price_history[-100:]
-            
-            # 计算技术指标
-            indicators = self._calculate_indicators()
-            
-            # 生成交易信号
-            signals = self._generate_signals(current_data, indicators)
-            
-            opportunities = []
-            
-            # 根据信号生成交易机会
-            for signal in signals:
-                opp = self._create_opportunity(signal, current_data)
-                if opp:
-                    opportunities.append(opp)
-            
-            log.info("strategy.scan.complete", 
-                    opportunities_found=len(opportunities),
-                    current_price=current_data.get("price"))
-            
-            return opportunities
-            
-        except Exception as e:
-            log.error("strategy.scan.failed", error=str(e))
-            return []
-    
-    async def evaluate(self, opp: Opportunity) -> Score:
-        """评估交易机会
-        
-        评估机会的质量和风险
-        计算得分和置信度
-        
-        Args:
-            opp: 交易机会
-            
-        Returns:
-            评估得分
-        """
-        try:
-            log.info("strategy.evaluate.start", 
-                    opportunity_title=opp.title)
-            
-            # 基础检查
-            if not self._validate_opportunity(opp):
-                return Score(
-                    value=0.0,
-                    confidence=0.0,
-                    reasoning="机会验证失败"
-                )
-            
-            # 提取机会信息
-            metadata = opp.metadata
-            signal_type = metadata.get("signal_type", "")
-            current_price = metadata.get("current_price", 0.0)
-            target_price = metadata.get("target_price", 0.0)
-            stop_loss = metadata.get("stop_loss", 0.0)
-            
-            # 计算预期收益
-            if signal_type == "buy":
-                expected_return = (target_price - current_price) / current_price
-                max_loss = (current_price - stop_loss) / current_price
-            else:  # sell
-                expected_return = (current_price - target_price) / current_price
-                max_loss = (stop_loss - current_price) / current_price
-            
-            # 计算风险收益比
-            risk_reward_ratio = abs(expected_return / max_loss) if max_loss != 0 else 0
-            
-            # 计算基础得分（0-1）
-            base_score = min(max(expected_return * 10, 0), 1)  # 预期收益映射到0-1
-            
-            # 风险调整
-            risk_adjustment = min(risk_reward_ratio / 3, 1)  # 风险收益比调整
-            
-            # 技术指标调整
-            tech_strength = metadata.get("tech_strength", 0.5)
-            tech_adjustment = tech_strength
-            
-            # 市场条件调整
-            market_condition = self._assess_market_condition()
-            market_adjustment = market_condition
-            
-            # 最终得分
-            final_score = (base_score * 0.4 + 
-                         risk_adjustment * 0.3 + 
-                         tech_adjustment * 0.2 + 
-                         market_adjustment * 0.1)
-            
-            # 置信度计算
-            confidence = min(final_score * 1.2, 1.0)  # 基于得分计算置信度
-            
-            # 生成评估理由
-            reasoning = (
-                f"信号类型: {signal_type}, "
-                f"预期收益: {expected_return:.2%}, "
-                f"风险收益比: {risk_reward_ratio:.2f}, "
-                f"技术强度: {tech_strength:.2f}, "
-                f"市场条件: {market_condition:.2f}"
-            )
-            
-            log.info("strategy.evaluate.complete",
-                    score=final_score,
-                    confidence=confidence,
-                    reasoning=reasoning)
-            
-            return Score(
-                value=final_score,
-                confidence=confidence,
-                reasoning=reasoning
-            )
-            
-        except Exception as e:
-            log.error("strategy.evaluate.failed", 
-                     error=str(e),
-                     opportunity_title=opp.title)
-            return Score(
-                value=0.0,
-                confidence=0.0,
-                reasoning=f"评估失败: {str(e)}"
-            )
-    
-    async def execute(self, opp: Opportunity) -> Result:
-        """执行交易
-        
-        执行买入或卖出操作
-        管理仓位和风险
-        
-        Args:
-            opp: 交易机会
-            
-        Returns:
-            执行结果
-        """
-        try:
-            log.info("strategy.execute.start",
-                    opportunity_title=opp.title,
-                    amount=opp.amount)
-            
-            # 验证机会
-            if not self._validate_opportunity(opp):
-                return Result(
-                    success=False,
-                    pnl=0.0,
-                    error="机会验证失败",
-                    metadata={}
-                )
-            
-            # 检查资金和仓位
-            if not self._check_capital_and_position(opp):
-                return Result(
-                    success=False,
-                    pnl=0.0,
-                    error="资金或仓位检查失败",
-                    metadata={}
-                )
-            
-            metadata = opp.metadata
-            signal_type = metadata.get("signal_type", "")
-            current_price = metadata.get("current_price", 0.0)
-            
-            # 模拟执行交易
-            execution_price = self._simulate_execution(
-                current_price, 
-                self.config["slippage_tolerance"]
-            )
-            
-            # 计算交易数量
-            quantity = opp.amount / execution_price
-            
-            # 更新状态
-            if signal_type == "buy":
-                self.current_position += opp.amount
-                log.info("buy.executed",
-                        quantity=quantity,
-                        price=execution_price,
-                        amount=opp.amount)
-            else:  # sell
-                self.current_position -= opp.amount
-                log.info("sell.executed",
-                        quantity=quantity,
-                        price=execution_price,
-                        amount=opp.amount)
-            
-            # 更新计数器
-            self.today_trades += 1
-            self.last_trade_time = datetime.now()
-            
-            # 模拟计算PNL（实际交易中需要跟踪持仓）
-            estimated_pnl = self._estimate_trade_pnl(
-                signal_type, 
-                execution_price, 
-                metadata
-            )
-            self.daily_pnl += estimated_pnl
-            
-            # 记录交易
-            trade_record = {
-                "timestamp": datetime.now(),
-                "type": signal_type,
-                "quantity": quantity,
-                "price": execution_price,
-                "amount": opp.amount,
-                "estimated_pnl": estimated_pnl,
-                "opportunity": opp.title
-            }
-            self.signals.append(trade_record)
-            
-            log.info("strategy.execute.complete",
-                    success=True,
-                    estimated_pnl=estimated_pnl,
-                    daily_pnl=self.daily_pnl,
-                    position=self.current_position)
-            
-            return Result(
-                success=True,
-                pnl=estimated_pnl,
-                error=None,
-                metadata={
-                    "execution_price": execution_price,
-                    "quantity": quantity,
-                    "trade_type": signal_type,
-                    "timestamp": datetime.now().isoformat()
-                }
-            )
-            
-        except Exception as e:
-            log.error("strategy.execute.failed",
-                     error=str(e),
-                     opportunity_title=opp.title)
-            return Result(
-                success=False,
-                pnl=0.0,
-                error=str(e),
-                metadata={}
-            )
-    
-    def estimate_roi(self) -> float:
-        """预估策略的ROI倍数
-        
-        基于历史表现和当前市场条件预估ROI
-        
-        Returns:
-            预估的ROI倍数
-        """
-        try:
-            # 如果有历史交易记录，基于历史计算
-            if self.signals:
-                total_pnl = sum(trade.get("estimated_pnl", 0) 
-                              for trade in self.signals)
-                total_invested = sum(trade.get("amount", 0) 
-                                   for trade in self.signals 
-                                   if trade.get("type") == "buy")
-                
-                if total_invested > 0:
-                    historical_roi = total_pnl / total_invested
-                else:
-                    historical_roi = 0.0
-            else:
-                historical_roi = 0.0
-            
-            # 考虑当前市场条件
-            market_condition = self._assess_market_condition()
-            
-            # 预估年化ROI（简化计算）
-            # 假设每日0.5%收益，年化约125%（250个交易日）
-            base_daily_return = 0.005
-            annualized_base = (1 + base_daily_return) ** 250 - 1
-            
-            # 根据市场条件调整
-            adjusted_annualized = annualized_base * market_condition
-            
-            # 结合历史表现
-            if historical_roi > 0:
-                estimated_roi = (adjusted_annualized + historical_roi) / 2
-            else:
-                estimated_roi = adjusted_annualized
-            
-            # 转换为倍数（例如1.25表示25%收益）
-            roi_multiple = 1 + estimated_roi
-            
-            log.info("roi.estimated",
-                    roi_multiple=roi_multiple,
-                    historical_roi=historical_roi,
-                    market_condition=market_condition)
-            
-            return roi_multiple
-            
-        except Exception as e:
-            log.error("roi.estimation.failed", error=str(e))
-            return 1.0  # 默认无收益
-    
-    async def teardown(self) -> None:
-        """清理资源，关闭连接"""
-        try:
-            log.info("strategy.teardown.start")
-            
-            # 关闭连接（模拟）
-            if self.market_data_conn:
-                self.market_data_conn["status"] = "disconnected"
-            
-            if self.trading_conn:
-                self.trading_conn["status"] = "disconnected"
-            
-            # 保存交易记录（模拟）
-            await self._save_trading_records()
-            
-            # 重置状态
-            self.initialized = False
-            
-            log.info("strategy.teardown.complete")
-            
-        except Exception as e:
-            log.error("strategy.teardown.failed", error=str(e))
-    
-    # ========== 辅助方法 ==========
-    
-    async def _load_historical_data(self) -> None:
-        """加载历史数据（模拟）"""
-        # 模拟加载最近100天的数据
-        dates = pd.date_range(end=datetime.now(), periods=100, freq='D')
-        prices = np.random.normal(180, 10, 100).cumsum() + 150
-        
-        for date, price in zip(dates, prices):
-            self.price_history.append({
-                "timestamp": date,
-                "price": float(price),
-                "volume": np.random.randint(1000000, 10000000)
-            })
-        
-        log.info("historical.data.loaded", records=len(self.price_history))
-    
-    def _reset_daily_counters(self) -> None:
-        """重置每日计数器"""
+    """RSI + Bollinger band swing signals on AAPL."""
+
+    name = "appl_trading"
+    description = "APPL做T策略 - 监控苹果公司股票进行波段交易 (advisory)"
+    risk_level = "medium"
+    min_llm_layer = 3
+
+    def __init__(self, feed: StockFeed | None = None, config: dict[str, Any] | None = None):
+        file_cfg = load_strategy_config(ApplTradingStrategy).get("parameters", {}) or {}
+        self.config = {**DEFAULT_CONFIG, **file_cfg, **(config or {})}
+        self._feed = feed or StockFeed()
+        self.paper_position = 0.0  # USD notionally held
         self.today_trades = 0
-        self.daily_pnl = 0.0
-        log.info("daily.counters.reset")
-    
-    def _is_market_open(self) -> bool:
-        """检查市场是否开盘"""
-        now = datetime.now()
-        current_hour = now.hour
-        
-        # 简单检查：美东时间9:30-16:00
-        # 实际应用中需要考虑节假日等
-        return (9 <= current_hour < 16)
-    
-    def _check_cooling_period(self) -> bool:
-        """检查冷却时间"""
-        if not self.last_trade_time:
-            return True
-        
-        cooling_seconds = self.config["cooling_period"]
-        time_since_last = (datetime.now() - self.last_trade_time).total_seconds()
-        
-        return time_since_last >= cooling_seconds
-    
-    async def _get_current_market_data(self) -> Dict[str, Any]:
-        """获取当前市场数据（模拟）"""
-        # 模拟实时数据
-        last_price = self.price_history[-1]["price"] if self.price_history else 180.0
-        current_price = last
+        self._trade_day = datetime.now(UTC).date()
+        self.last_signal_time: datetime | None = None
+
+    def _roll_day(self) -> None:
+        today = datetime.now(UTC).date()
+        if today != self._trade_day:
+            self._trade_day = today
+            self.today_trades = 0
+
+    async def scan(self) -> list[Opportunity]:
+        self._roll_day()
+        cfg = self.config
+        if self.today_trades >= cfg["max_daily_trades"]:
+            return []
+        if self.last_signal_time:
+            elapsed = (datetime.now(UTC) - self.last_signal_time).total_seconds()
+            if elapsed < cfg["cooling_period"]:
+                return []
+
+        bars = await self._feed.get_ohlcv(cfg["symbol"], days=cfg["lookback_days"])
+        closes = [b.close for b in bars]
+        value = rsi(closes, cfg["rsi_period"])
+        bands = bollinger(closes, cfg["bollinger_period"], cfg["bollinger_std"])
+        if value is None or bands is None:
+            return []
+
+        lower, mid, upper = bands
+        price = closes[-1]
+
+        if self.paper_position < cfg["max_position"] and (
+            value < cfg["rsi_oversold"] or price <= lower
+        ):
+            side = "buy"
+            amount = min(cfg["base_amount"], cfg["max_position"] - self.paper_position)
+            target = max(mid, price * (1 + cfg["min_profit_percent"]))
+            stop = price * (1 - cfg["max_loss_percent"])
+        elif self.paper_position > 0 and (value > cfg["rsi_overbought"] or price >= upper):
+            side = "sell"
+            amount = min(cfg["base_amount"], self.paper_position)
+            target = min(mid, price * (1 - cfg["min_profit_percent"]))
+            stop = price * (1 + cfg["max_loss_percent"])
+        else:
+            return []
+
+        self.last_signal_time = datetime.now(UTC)
+        return [
+            Opportunity(
+                strategy_name=self.name,
+                title=f"{cfg['symbol']} {side.upper()} @ {price:.2f} (RSI {value:.0f})",
+                money_involved=amount,
+                data={
+                    "symbol": cfg["symbol"],
+                    "signal_type": side,
+                    "price": price,
+                    "rsi": value,
+                    "bb_lower": lower,
+                    "bb_mid": mid,
+                    "bb_upper": upper,
+                    "target_price": target,
+                    "stop_loss": stop,
+                },
+            )
+        ]
+
+    async def evaluate(self, opp: Opportunity) -> Score:
+        cfg = self.config
+        d = opp.data
+        price, target, stop = d.get("price", 0), d.get("target_price", 0), d.get("stop_loss", 0)
+        if not price or not target or not stop:
+            return Score(value=0.0, reasoning="incomplete signal data")
+
+        expected = abs(target - price) / price
+        max_loss = abs(stop - price) / price
+        rr = expected / max_loss if max_loss else 0.0
+        value = d.get("rsi", 50.0)
+        if d.get("signal_type") == "buy":
+            strength = max(0.0, (cfg["rsi_oversold"] - value) / cfg["rsi_oversold"])
+            band_hit = price <= d.get("bb_lower", 0)
+        else:
+            strength = max(0.0, (value - cfg["rsi_overbought"]) / (100 - cfg["rsi_overbought"]))
+            band_hit = price >= d.get("bb_upper", float("inf"))
+
+        score = 0.3 + 0.3 * min(strength * 2, 1.0) + 0.2 * band_hit + 0.2 * min(rr / 2, 1.0)
+        return Score(
+            value=round(min(score, 1.0), 2),
+            threshold=0.5,
+            reasoning=(
+                f"RSI {value:.1f}, expected {expected:.2%}, reward/risk {rr:.2f},"
+                f" band {'hit' if band_hit else 'not hit'}"
+            ),
+        )
+
+    async def execute(self, opp: Opportunity) -> Result:
+        """Advisory: record the paper trade and surface the suggestion."""
+        side = opp.data.get("signal_type")
+        if side == "buy":
+            self.paper_position += opp.money_involved
+        elif side == "sell":
+            self.paper_position = max(0.0, self.paper_position - opp.money_involved)
+        self.today_trades += 1
+        log.info("appl_trading.signal", side=side, amount=opp.money_involved)
+        return Result(
+            success=True,
+            profit_loss=0.0,
+            details={
+                "action": "advisory",
+                "message": (
+                    f"Consider {side} ${opp.money_involved:,.0f} of {opp.data.get('symbol')} near "
+                    f"{opp.data.get('price', 0):.2f} (target {opp.data.get('target_price', 0):.2f},"
+                    f" stop {opp.data.get('stop_loss', 0):.2f})"
+                ),
+                "paper_position": self.paper_position,
+                **opp.data,
+            },
+        )
+
+    def estimate_roi(self) -> float:
+        return 1.05
