@@ -9,6 +9,10 @@ from typing import Any
 import click
 import structlog
 
+from moneyclaw.plugins.base import load_strategy_config
+
+log = structlog.get_logger()
+
 _LOG_LEVELS = {
     "DEBUG": logging.DEBUG,
     "INFO": logging.INFO,
@@ -113,6 +117,18 @@ async def _run(web: bool, telegram: bool) -> None:
             exchange_mgr.connect("okx", settings.exchange.okx_api_key, settings.exchange.okx_secret)
     executor = TradeExecutor(exchange_mgr, dry_run=dry_run)
 
+    # One switch for everything: EXCHANGE_DRY_RUN. Keep the risk manager in agreement.
+    settings.risk.dry_run = dry_run
+
+    # Alpaca stock executor (dollar-based orders, hard budget caps, no funding endpoints)
+    from moneyclaw.execution.alpaca import AlpacaExecutor
+
+    if not dry_run and not (settings.alpaca.api_key and settings.alpaca.secret_key):
+        raise click.ClickException(
+            "EXCHANGE_DRY_RUN=false requires ALPACA_API_KEY and ALPACA_SECRET_KEY in .env"
+        )
+    stock_executor = AlpacaExecutor(settings.alpaca, settings.risk, dry_run=dry_run)
+
     # Data feeds
     from moneyclaw.data.feeds.crypto import CryptoFeed
     from moneyclaw.data.feeds.news import NewsFeed
@@ -128,6 +144,7 @@ async def _run(web: bool, telegram: bool) -> None:
     evaluator = Evaluator(llm=llm)
     planner = Planner(llm=llm)
     risk = RiskManager(settings=settings.risk)
+    risk.set_exposure_provider(lambda: stock_executor.deployed_capital)
     scheduler = Scheduler()
     strategies = StrategyRegistry()
 
@@ -150,6 +167,7 @@ async def _run(web: bool, telegram: bool) -> None:
         scheduler=scheduler,
         notifier=notifier,
         executor=executor,
+        stock_executor=stock_executor,
     )
 
     # Discover and register strategies — inject deps based on what they need
@@ -161,8 +179,12 @@ async def _run(web: bool, telegram: bool) -> None:
             stock_feed=stock_feed,
             executor=executor,
             exchange_manager=exchange_mgr,
+            stock_executor=stock_executor,
         )
         await strategies.register(instance)
+        if load_strategy_config(cls).get("enabled", True) is False:
+            strategies.disable(instance.name)
+            log.info("strategy.disabled_by_config", strategy=instance.name)
 
     # --- Schedule jobs ---
     from moneyclaw.scheduler.jobs import register_all_jobs
@@ -176,6 +198,9 @@ async def _run(web: bool, telegram: bool) -> None:
         crypto_feed=crypto_feed,
         storage=storage,
         settings=settings,
+        collect_crypto=any(
+            s.name.startswith("crypto") or s.name == "smart_rebalance" for s in strategies.active
+        ),
     )
 
     # Build tasks list
@@ -183,6 +208,10 @@ async def _run(web: bool, telegram: bool) -> None:
 
     # Start agent brain
     tasks.append(asyncio.create_task(brain.start()))
+
+    # Create strategy chat interface for AI-powered strategy management
+    from moneyclaw.agent.strategy_chat import StrategyChatInterface
+    strategy_chat = StrategyChatInterface(llm_router=llm, strategy_registry=strategies)
 
     # Start Telegram bot
     if telegram and settings.telegram.token:
@@ -197,12 +226,9 @@ async def _run(web: bool, telegram: bool) -> None:
             strategies=strategies,
             risk=risk,
             strategy_chat=strategy_chat,
+            stock_executor=stock_executor,
         )
         tasks.append(asyncio.create_task(tg_bot.start()))
-
-    # Create strategy chat interface for AI-powered strategy management
-    from moneyclaw.agent.strategy_chat import StrategyChatInterface
-    strategy_chat = StrategyChatInterface(llm_router=llm, strategy_registry=strategies)
 
     # Start web dashboard
     if web:
@@ -219,8 +245,16 @@ async def _run(web: bool, telegram: bool) -> None:
         server = uvicorn.Server(config)
         tasks.append(asyncio.create_task(server.serve()))
 
-    mode = "DRY RUN" if dry_run else "LIVE"
-    click.echo(f"MoneyClaw running [{mode}] — {len(strategy_classes)} strategies loaded")
+    mode = "DRY RUN" if dry_run else ("ALPACA PAPER" if settings.alpaca.paper else "LIVE MONEY")
+    click.echo(
+        f"MoneyClaw running [{mode}] — {len(strategies.active)}/{len(strategy_classes)}"
+        f" strategies active: {', '.join(s.name for s in strategies.active)}"
+    )
+    r = settings.risk
+    click.echo(
+        f"Risk: max trade ${r.max_trade_amount:.2f}, budget ${r.max_portfolio_budget:.2f},"
+        f" daily loss ${r.max_daily_loss:.2f}, approval ≥ ${r.approval_threshold:.2f}"
+    )
 
     # Show discovered models
     model_info = []
@@ -242,7 +276,9 @@ async def _run(web: bool, telegram: bool) -> None:
         await memory.close()
 
 
-def _instantiate_strategy(cls, *, crypto_feed, stock_feed, executor, exchange_manager):
+def _instantiate_strategy(
+    cls, *, crypto_feed, stock_feed, executor, exchange_manager, stock_executor=None
+):
     """Create a strategy instance, injecting dependencies based on its constructor."""
     name = cls.__name__ if hasattr(cls, "__name__") else str(cls)
 
@@ -261,6 +297,8 @@ def _instantiate_strategy(cls, *, crypto_feed, stock_feed, executor, exchange_ma
             kwargs["executor"] = executor
         elif param_name == "exchange_manager":
             kwargs["exchange_manager"] = exchange_manager
+        elif param_name == "stock_executor":
+            kwargs["stock_executor"] = stock_executor
 
     try:
         return cls(**kwargs)

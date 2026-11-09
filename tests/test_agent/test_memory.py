@@ -69,3 +69,25 @@ class TestMemory:
         history = await memory.get_history()
         assert len(history) == 1
         assert history[0]["profit_loss"] == 10.0
+
+
+class TestApprovedQueue:
+    async def test_approved_roundtrip_keeps_amount(self, tmp_path) -> None:
+        from moneyclaw.agent.memory import Memory
+        from moneyclaw.plugins.base import Opportunity
+
+        memory = Memory(db_path=tmp_path / "m.db")
+        await memory.init()
+        opp = Opportunity(id="x1", strategy_name="s", title="t", money_involved=17.5, data={"a": 1})
+        await memory.record_pending(opp)
+        pending = await memory.get_pending()
+        assert pending[0]["data"] == {"a": 1} and pending[0]["money_involved"] == 17.5
+        assert await memory.get_approved() == []
+
+        await memory.approve("x1")
+        approved = await memory.get_approved()
+        assert approved[0]["money_involved"] == 17.5 and approved[0]["data"] == {"a": 1}
+
+        await memory.set_status("x1", "blocked")
+        assert await memory.get_approved() == []
+        await memory.close()

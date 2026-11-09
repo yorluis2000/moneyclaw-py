@@ -18,6 +18,7 @@ def _make_brain(*, strategies=None, notifier=None):
     memory.today_pnl = AsyncMock(return_value=0.0)
     memory.pending_count = AsyncMock(return_value=0)
     memory.get_pending = AsyncMock(return_value=[])
+    memory.get_approved = AsyncMock(return_value=[])
 
     from moneyclaw.config.settings import RiskSettings
     from moneyclaw.execution.risk import RiskManager
@@ -130,3 +131,98 @@ class TestBrainStatus:
         assert "risk" in status
         assert "dry_run" in status
         assert "tick_count" in status
+
+
+class TestApprovals:
+    def _approved(self, money: float) -> dict:
+        return {
+            "id": "opp1",
+            "strategy": "s",
+            "title": "BUY NVDA",
+            "money_involved": money,
+            "data": {"symbol": "NVDA", "side": "buy"},
+        }
+
+    async def test_approved_trade_executes_with_amount(self) -> None:
+        strategy = AsyncMock()
+        strategy.name = "s"
+        strategy.scan = AsyncMock(return_value=[])
+        strategy.execute = AsyncMock(return_value=Result(success=True))
+        brain = _make_brain(strategies=[strategy])
+        brain._strategies.get = MagicMock(return_value=strategy)
+        brain._memory.get_approved = AsyncMock(return_value=[self._approved(18.0)])
+
+        await brain._tick()
+        executed = strategy.execute.call_args.args[0]
+        assert executed.id == "opp1" and executed.money_involved == 18.0
+
+    async def test_approved_trade_rechecks_limits(self) -> None:
+        strategy = AsyncMock()
+        strategy.name = "s"
+        strategy.scan = AsyncMock(return_value=[])
+        notifier = AsyncMock()
+        brain = _make_brain(strategies=[strategy], notifier=notifier)
+        brain._strategies.get = MagicMock(return_value=strategy)
+        brain._memory.get_approved = AsyncMock(return_value=[self._approved(18.0)])
+        brain._risk.update_limits(max_trade_amount=10)  # lowered after approval was requested
+
+        await brain._tick()
+        strategy.execute.assert_not_called()
+        brain._memory.set_status.assert_awaited_once_with("opp1", "blocked")
+        notifier.alert.assert_awaited_once()
+
+    async def test_risk_blocked_alert_sent_once(self) -> None:
+        opp = Opportunity(
+            strategy_name="s", title="BUY NVDA", money_involved=999, data={"symbol": "NVDA"}
+        )
+        strategy = AsyncMock()
+        strategy.name = "s"
+        strategy.scan = AsyncMock(return_value=[opp])
+        notifier = AsyncMock()
+        brain = _make_brain(strategies=[strategy], notifier=notifier)
+        brain._evaluator.score = AsyncMock(return_value=Score(value=0.9, threshold=0.5))
+        await brain._tick()
+        await brain._tick()
+        assert notifier.alert.await_count == 1
+
+    async def test_tick_refreshes_stock_positions(self) -> None:
+        brain = _make_brain()
+        brain._stock_executor = AsyncMock()
+        await brain._tick()
+        brain._stock_executor.refresh.assert_awaited_once()
+
+
+class TestScoringFallback:
+    async def test_falls_back_to_strategy_evaluate_when_llm_unavailable(self) -> None:
+        opp = Opportunity(strategy_name="s", title="T", money_involved=5)
+        strategy = AsyncMock()
+        strategy.name = "s"
+        strategy.scan = AsyncMock(return_value=[opp])
+        strategy.evaluate = AsyncMock(return_value=Score(value=0.9, threshold=0.5))
+        strategy.execute = AsyncMock(return_value=Result(success=True))
+        brain = _make_brain(strategies=[strategy])
+        brain._strategies.get = MagicMock(return_value=strategy)
+        brain._evaluator.score = AsyncMock(side_effect=RuntimeError("No suitable model"))
+
+        await brain._tick()
+        strategy.execute.assert_awaited_once_with(opp)
+
+    async def test_bad_opportunity_does_not_abort_tick(self) -> None:
+        bad = Opportunity(strategy_name="s", title="bad", money_involved=5)
+        good = Opportunity(strategy_name="s", title="good", money_involved=5, pre_score=0.9)
+        strategy = AsyncMock()
+        strategy.name = "s"
+        strategy.scan = AsyncMock(return_value=[bad, good])
+        strategy.evaluate = AsyncMock(side_effect=ValueError("boom"))
+        strategy.execute = AsyncMock(return_value=Result(success=True))
+        brain = _make_brain(strategies=[strategy])
+        brain._strategies.get = MagicMock(return_value=strategy)
+
+        async def score(o):
+            if o is bad:
+                raise RuntimeError("llm down")
+            return Score(value=0.9, threshold=0.5)
+
+        brain._evaluator.score = score
+        await brain._tick()
+        strategy.execute.assert_awaited_once_with(good)

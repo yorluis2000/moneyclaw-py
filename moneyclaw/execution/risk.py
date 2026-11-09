@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import structlog
 
 from moneyclaw.config.settings import RiskSettings
@@ -22,11 +24,44 @@ class RiskManager:
         self._paused = False
         # Per-strategy daily loss tracking
         self._strategy_daily_loss: dict[str, float] = {}
+        # Returns USD currently deployed in open positions (set by the stock executor)
+        self._exposure_provider: Callable[[], float] | None = None
+
+    @staticmethod
+    def is_exit(opp: Opportunity) -> bool:
+        """Sells reduce exposure; they skip size/budget/approval limits but honor pause."""
+        return opp.data.get("side") == "sell"
+
+    def set_exposure_provider(self, provider: Callable[[], float]) -> None:
+        self._exposure_provider = provider
+
+    @property
+    def deployed(self) -> float:
+        if not self._exposure_provider:
+            return 0.0
+        try:
+            return float(self._exposure_provider())
+        except Exception:
+            log.exception("risk.exposure_error")
+            return float("inf")  # Fail closed: block new buys if exposure is unknown
 
     def allow(self, opp: Opportunity) -> bool:
         """Check if this opportunity passes risk controls."""
         if self._paused:
             log.info("risk.paused")
+            return False
+
+        if self.is_exit(opp):
+            return True
+
+        # Total portfolio budget across open positions
+        if self.deployed + opp.money_involved > self._settings.max_portfolio_budget + 1e-9:
+            log.warning(
+                "risk.budget_exceeded",
+                amount=opp.money_involved,
+                deployed=self.deployed,
+                budget=self._settings.max_portfolio_budget,
+            )
             return False
 
         # Daily loss limit (global)
@@ -78,7 +113,39 @@ class RiskManager:
 
     def needs_approval(self, opp: Opportunity) -> bool:
         """Does this opportunity need human approval?"""
+        if self.is_exit(opp):
+            return False
         return opp.money_involved >= self._settings.approval_threshold
+
+    def update_limits(
+        self,
+        *,
+        max_portfolio_budget: float | None = None,
+        max_trade_amount: float | None = None,
+        max_daily_loss: float | None = None,
+        approval_threshold: float | None = None,
+    ) -> None:
+        """Change limits at runtime (e.g. from Telegram). Values must be positive.
+
+        Changes are in-memory; set the RISK_* variables in .env to make them permanent.
+        """
+        updates = {
+            "max_portfolio_budget": max_portfolio_budget,
+            "max_trade_amount": max_trade_amount,
+            "max_daily_loss": max_daily_loss,
+            "approval_threshold": approval_threshold,
+        }
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if not (value > 0) or value != value or value == float("inf"):
+                raise ValueError(f"{key} must be a positive number")
+            setattr(self._settings, key, float(value))
+            log.info("risk.limit_updated", limit=key, value=value)
+
+    @property
+    def settings(self):
+        return self._settings
 
     def record_outcome(self, profit_loss: float, strategy_name: str = "") -> None:
         """Update risk state based on trade outcome."""
@@ -110,6 +177,7 @@ class RiskManager:
         return self._paused
 
     def status(self) -> dict:
+        deployed = self.deployed
         return {
             "paused": self._paused,
             "dry_run": self._settings.dry_run,
@@ -119,4 +187,8 @@ class RiskManager:
             "cooldown_threshold": self._settings.cooldown_after_losses,
             "strategy_daily_losses": dict(self._strategy_daily_loss),
             "max_position_ratio": self._settings.max_position_ratio,
+            "max_trade_amount": self._settings.max_trade_amount,
+            "approval_threshold": self._settings.approval_threshold,
+            "max_portfolio_budget": self._settings.max_portfolio_budget,
+            "deployed": deployed if deployed != float("inf") else None,
         }

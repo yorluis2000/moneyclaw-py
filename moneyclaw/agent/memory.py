@@ -72,7 +72,15 @@ class Memory:
             "INSERT OR REPLACE INTO opportunities"
             " (id, strategy, title, data, score, status, created_at, updated_at)"
             " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
-            (opp.id, opp.strategy_name, opp.title, json.dumps(opp.data), 0.0, now, now),
+            (
+                opp.id,
+                opp.strategy_name,
+                opp.title,
+                json.dumps({**opp.data, "_money_involved": opp.money_involved}),
+                0.0,
+                now,
+                now,
+            ),
         )
         await self._db.commit()
 
@@ -141,11 +149,44 @@ class Memory:
                     "id": r[0],
                     "strategy": r[1],
                     "title": r[2],
-                    "data": json.loads(r[3]),
+                    "data": {k: v for k, v in json.loads(r[3]).items() if k != "_money_involved"},
+                    "money_involved": float(json.loads(r[3]).get("_money_involved", 0.0) or 0.0),
                     "created_at": r[4],
                 }
                 for r in rows
             ]
+
+    async def get_approved(self) -> list[dict]:
+        """Opportunities the user approved that have not been executed yet."""
+        assert self._db
+        async with self._db.execute(
+            "SELECT id, strategy, title, data, created_at FROM opportunities"
+            " WHERE status = 'approved' ORDER BY created_at ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        items = []
+        for r in rows:
+            data = json.loads(r[3])
+            money = float(data.pop("_money_involved", 0.0) or 0.0)
+            items.append(
+                {
+                    "id": r[0],
+                    "strategy": r[1],
+                    "title": r[2],
+                    "data": data,
+                    "money_involved": money,
+                    "created_at": r[4],
+                }
+            )
+        return items
+
+    async def set_status(self, opp_id: str, status: str) -> None:
+        assert self._db
+        await self._db.execute(
+            "UPDATE opportunities SET status = ?, updated_at = ? WHERE id = ?",
+            (status, time.time(), opp_id),
+        )
+        await self._db.commit()
 
     async def approve(self, opp_id: str) -> bool:
         assert self._db

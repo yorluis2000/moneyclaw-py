@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import structlog
@@ -11,6 +12,7 @@ if TYPE_CHECKING:
     from moneyclaw.agent.evaluator import Evaluator
     from moneyclaw.agent.memory import Memory
     from moneyclaw.agent.planner import Planner
+    from moneyclaw.execution.alpaca import AlpacaExecutor
     from moneyclaw.execution.risk import RiskManager
     from moneyclaw.execution.trading import TradeExecutor
     from moneyclaw.interface.telegram.notify import Notifier
@@ -38,6 +40,7 @@ class AgentBrain:
         scheduler: Scheduler,
         notifier: Notifier | None = None,
         executor: TradeExecutor | None = None,
+        stock_executor: AlpacaExecutor | None = None,
     ) -> None:
         self._llm = llm
         self._memory = memory
@@ -48,6 +51,9 @@ class AgentBrain:
         self._scheduler = scheduler
         self._notifier = notifier
         self._executor = executor
+        self._stock_executor = stock_executor
+        # (day, strategy, symbol, side) already reported as risk-blocked — avoids spam
+        self._blocked_alerts: set[tuple] = set()
         self._running = False
         self._tick_count = 0
 
@@ -86,6 +92,10 @@ class AgentBrain:
         """One iteration of the main loop."""
         self._tick_count += 1
 
+        # Sync real positions so budget checks see current exposure
+        if self._stock_executor:
+            await self._stock_executor.refresh()
+
         # Process any approved-but-not-yet-executed opportunities
         await self._process_approved()
 
@@ -106,8 +116,8 @@ class AgentBrain:
         # 2. THINK — evaluate and prioritize
         scored = []
         for opp in all_opportunities:
-            score = await self._evaluator.score(opp)
-            if score.value > score.threshold:
+            score = await self._score(opp)
+            if score and score.value > score.threshold:
                 scored.append((opp, score))
 
         scored.sort(key=lambda x: x[1].value, reverse=True)
@@ -116,10 +126,19 @@ class AgentBrain:
         for opp, _score in scored:
             if not self._risk.allow(opp):
                 log.info("agent.risk_blocked", opportunity=opp.id)
-                if self._notifier:
+                key = (
+                    datetime.now(UTC).date(),
+                    opp.strategy_name,
+                    opp.data.get("symbol", opp.title),
+                    opp.data.get("side", ""),
+                )
+                if self._notifier and key not in self._blocked_alerts:
+                    self._blocked_alerts = {k for k in self._blocked_alerts if k[0] == key[0]}
+                    self._blocked_alerts.add(key)
                     await self._notifier.alert(
                         "Risk blocked",
-                        f"{opp.title} (${opp.money_involved:.2f})",
+                        f"{opp.title} (${opp.money_involved:.2f})\n"
+                        f"Limits: {self._limits_summary()}",
                     )
                 continue
 
@@ -131,6 +150,23 @@ class AgentBrain:
                 continue
 
             await self._execute_opportunity(opp)
+
+    async def _score(self, opp):
+        """Score via the evaluator (rules or LLM); fall back to the strategy's own
+        rule-based evaluate() if the LLM is unavailable. One bad opportunity never
+        aborts the tick."""
+        try:
+            return await self._evaluator.score(opp)
+        except Exception as e:
+            log.warning("agent.evaluator_failed", opportunity=opp.id, error=str(e))
+        strategy = self._strategies.get(opp.strategy_name)
+        if not strategy:
+            return None
+        try:
+            return await strategy.evaluate(opp)
+        except Exception:
+            log.exception("agent.strategy_evaluate_failed", opportunity=opp.id)
+            return None
 
     async def _execute_opportunity(self, opp) -> None:
         """Execute an opportunity and record the outcome."""
@@ -157,20 +193,35 @@ class AgentBrain:
         except Exception:
             log.exception("agent.execute_error", opportunity=opp.id)
 
+    def _limits_summary(self) -> str:
+        r = self._risk.status()
+        return (
+            f"max trade ${r['max_trade_amount']:.2f}, budget ${r['max_portfolio_budget']:.2f}"
+            f" (deployed ${r['deployed'] or 0:.2f}), daily loss"
+            f" ${r['daily_loss']:.2f}/${r['daily_loss_limit']:.2f}"
+        )
+
     async def _process_approved(self) -> None:
         """Execute opportunities that have been approved by the user."""
-        pending = await self._memory.get_pending()
-        for item in pending:
-            if item.get("status") != "approved":
-                continue
-            from moneyclaw.plugins.base import Opportunity
+        from moneyclaw.plugins.base import Opportunity
 
+        for item in await self._memory.get_approved():
             opp = Opportunity(
                 id=item["id"],
                 strategy_name=item["strategy"],
                 title=item["title"],
+                money_involved=item.get("money_involved", 0.0),
                 data=item.get("data", {}),
             )
+            # Limits may have changed since approval was requested — re-check
+            if not self._risk.allow(opp):
+                await self._memory.set_status(opp.id, "blocked")
+                if self._notifier:
+                    await self._notifier.alert(
+                        "Approved trade blocked by risk limits",
+                        f"{opp.title} (${opp.money_involved:.2f})\n{self._limits_summary()}",
+                    )
+                continue
             await self._execute_opportunity(opp)
 
     @property

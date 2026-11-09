@@ -3,3 +3,6 @@
 
 # Minimum funding rate to trigger (0.001 = 0.1% per 8h, ~36% annualized)
 threshold: 0.001
+
+# Stocks-only mode: crypto strategies are off by default. Set to true to re-enable.
+enabled: false

@@ -84,6 +84,42 @@ Each strategy has a `config.yaml` in its directory for customization.
 - Cooldown after consecutive losses
 - Complete audit trail in SQLite
 
+## Stocks-Only Mode (Alpaca + Telegram)
+
+This fork runs as a stocks/ETF-only agent. Crypto strategies ship with `enabled: false`
+in their `config.yaml`; set it to `true` to bring one back.
+
+**Active strategies:** `ai_longevity_growth` (NVDA, PLTR, AMD, AVGO, PATH, RXRX, ISRG,
+CRSP, NTLA, TEM, LLY), `gold_trading` (GLD), `appl_trading` (AAPL) and `stock_dividend`
+(advisory only).
+
+**Orders** are dollar-based (fractional) market orders on Alpaca, sent only during
+regular market hours. The executor can only call Alpaca's trading, position and
+account-read endpoints. Anything involving funding, ACH, bank links or transfers is refused
+in code before any request is made.
+
+**Risk limits** (defaults for a $50 budget, set in `.env`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RISK_MAX_TRADE_AMOUNT` | 20 | Max $ per buy |
+| `RISK_MAX_PORTFOLIO_BUDGET` | 50 | Max $ deployed across all open positions, whatever the account size |
+| `RISK_APPROVAL_THRESHOLD` | 15 | Buys at or above this wait for `/approve` in Telegram |
+| `RISK_MAX_DAILY_LOSS` | 20 | No new buys after this much realized loss in a day |
+
+Sells (take profit / stop loss) are never blocked by size, budget or approval limits, so
+exits can't get stuck. `/pause` does stop them.
+
+**Modes:**
+
+| `EXCHANGE_DRY_RUN` | `ALPACA_PAPER` | Result |
+|---|---|---|
+| `true` (default) | any | Everything is simulated locally; no keys needed |
+| `false` | `true` | Real orders on Alpaca **paper** trading (fake money) |
+| `false` | `false` | Real orders with **real money** |
+
+Start in dry-run, then run on paper for a while before going live.
+
 ## Development Setup
 
 ### Prerequisites
@@ -94,7 +130,7 @@ Each strategy has a `config.yaml` in its directory for customization.
 ### Install
 
 ```bash
-git clone https://github.com/MindDock/moneyclaw-py.git
+git clone https://github.com/yorluis2000/moneyclaw-py.git
 cd moneyclaw-py
 
 # Create virtual environment
@@ -248,11 +284,20 @@ deploy:
 | `/report` | Detailed report (daily/weekly/monthly) |
 | `/approve <id>` | Approve a pending operation |
 | `/reject <id>` | Reject a pending operation |
-| `/pause` | Pause all strategies |
-| `/resume` | Resume operations |
+| `/pause` | Pause all trading |
+| `/resume` | Resume trading |
+| `/positions` | Stock holdings, P&L, budget used |
+| `/limits` | Current risk limits |
+| `/budget <usd>` | Set max total $ in open positions |
+| `/maxtrade <usd>` | Set max $ per trade |
+| `/maxloss <usd>` | Set daily loss limit |
 | `/cost` | Agent's own running cost |
 | `/strategies` | Strategy performance overview |
 | `/ask <question>` | Ask the agent anything |
+
+The bot only responds to the chat in `TELEGRAM_CHAT_ID`. Until that's set, it replies
+with your chat id so you can add it. Limits changed from Telegram last until restart; put
+them in `.env` to make them permanent.
 
 ## Writing Strategies
 

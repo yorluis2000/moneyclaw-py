@@ -1,0 +1,35 @@
+# AI & Longevity Growth — automated swing trading on Alpaca (dollar-based orders)
+enabled: true
+
+watchlist:
+  # AI & fast-growth tech
+  - NVDA
+  - PLTR
+  - AMD
+  - AVGO
+  - PATH
+  # Longevity / AI biotech
+  - RXRX
+  - ISRG
+  - CRSP
+  - NTLA
+  - TEM
+  - LLY
+
+trade_amount: 10.0          # USD per buy (risk limits still cap this: RISK_MAX_TRADE_AMOUNT / budget)
+max_open_positions: 5
+lookback_days: 180          # daily bars used for indicators (today's bar updates intraday)
+
+rsi_period: 14
+rsi_oversold: 35            # buy-low zone
+rsi_overbought: 70          # sell-high zone
+bollinger_period: 20
+bollinger_std: 2
+trend_period: 100           # only buy dips while price is within trend_tolerance of this SMA
+trend_tolerance: 0.10
+momentum_period: 10         # rate-of-change lookback, used in scoring
+
+take_profit_pct: 0.08       # sell when +8% over entry
+stop_loss_pct: 0.07         # sell when -7% under entry
+signal_cooldown_minutes: 60 # don't re-signal the same ticker within this window
+min_score: 0.55

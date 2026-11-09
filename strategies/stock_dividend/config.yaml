@@ -15,3 +15,5 @@ watchlist:
 
 # Minimum dividend yield to trigger alert (0.04 = 4%)
 min_yield: 0.04
+
+enabled: true

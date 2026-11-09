@@ -5,3 +5,6 @@ coin: bitcoin
 symbol: BTC/USDT
 amount_usd: 10.0
 exchange_id: binance
+
+# Stocks-only mode: crypto strategies are off by default. Set to true to re-enable.
+enabled: false

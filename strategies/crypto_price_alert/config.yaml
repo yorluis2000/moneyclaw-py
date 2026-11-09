@@ -18,3 +18,6 @@ alerts:
     condition: above
     threshold: 300
     message: "SOL above $300!"
+
+# Stocks-only mode: crypto strategies are off by default. Set to true to re-enable.
+enabled: false

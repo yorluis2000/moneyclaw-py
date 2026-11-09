@@ -1,5 +1,7 @@
 """Tests for risk management."""
 
+import pytest
+
 from moneyclaw.config.settings import RiskSettings
 from moneyclaw.execution.risk import RiskManager
 from moneyclaw.plugins.base import Opportunity
@@ -81,3 +83,53 @@ class TestRiskManager:
 
         risk.reset_daily()
         assert risk.allow(opp) is True
+
+
+class TestPortfolioBudget:
+    def _risk(self, deployed: float, **kw) -> RiskManager:
+        r = RiskManager(RiskSettings(max_trade_amount=20, max_portfolio_budget=50, **kw))
+        r.set_exposure_provider(lambda: deployed)
+        return r
+
+    def test_defaults_sized_for_50_budget(self) -> None:
+        s = RiskSettings()
+        assert (s.max_trade_amount, s.max_daily_loss, s.approval_threshold) == (20, 20, 15)
+        assert s.max_portfolio_budget == 50
+
+    def test_blocks_buy_over_budget(self) -> None:
+        assert self._risk(40).allow(Opportunity(money_involved=10)) is True
+        assert self._risk(45).allow(Opportunity(money_involved=10)) is False
+
+    def test_sells_bypass_size_budget_and_approval(self) -> None:
+        r = self._risk(60, max_daily_loss=1)
+        r.record_outcome(-5)
+        sell = Opportunity(money_involved=30, data={"side": "sell"})
+        assert r.allow(sell) is True
+        assert r.needs_approval(sell) is False
+        r.pause()
+        assert r.allow(sell) is False
+
+    def test_unknown_exposure_fails_closed(self) -> None:
+        r = RiskManager(RiskSettings())
+
+        def boom() -> float:
+            raise RuntimeError
+
+        r.set_exposure_provider(boom)
+        assert r.allow(Opportunity(money_involved=1)) is False
+        assert r.status()["deployed"] is None
+
+    def test_update_limits(self) -> None:
+        r = self._risk(0)
+        r.update_limits(max_portfolio_budget=100, max_trade_amount=30, max_daily_loss=10)
+        st = r.status()
+        assert (st["max_portfolio_budget"], st["max_trade_amount"], st["daily_loss_limit"]) == (
+            100,
+            30,
+            10,
+        )
+
+    @pytest.mark.parametrize("bad", [0, -5, float("nan"), float("inf")])
+    def test_update_limits_rejects_bad_values(self, bad: float) -> None:
+        with pytest.raises(ValueError):
+            self._risk(0).update_limits(max_trade_amount=bad)

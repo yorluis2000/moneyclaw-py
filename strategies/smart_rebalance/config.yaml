@@ -12,3 +12,6 @@ deviation_threshold: 0.05
 
 # Exchange to use for balance queries and trades
 exchange_id: binance
+
+# Stocks-only mode: crypto strategies are off by default. Set to true to re-enable.
+enabled: false

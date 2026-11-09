@@ -64,6 +64,8 @@ class Notifier:
             f"P&L: {sign}${pnl:.2f}\n"
             f"Status: {'Success' if result.success else 'Failed'}"
         )
+        if result.details.get("message"):
+            text += f"\n{result.details['message']}"
         if "order_id" in result.details:
             text += f"\nOrder: {result.details['order_id']}"
         await self.send(text)

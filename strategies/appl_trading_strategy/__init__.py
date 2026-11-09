@@ -1,27 +1,32 @@
 """AAPL swing-trading signals (APPL做T交易策略).
 
 Watches Apple (AAPL) and flags buy-low / sell-high moments using RSI and Bollinger
-bands on recent daily bars. Advisory only: it keeps a paper position to decide when
-a sell signal applies, and never places real orders.
+bands on recent daily bars. With a stock executor it trades via Alpaca
+(dollar-based, budget-capped; sells close the whole position). Without one it is
+advisory and keeps a paper position.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
 from moneyclaw.data.feeds.stocks import StockFeed
 from moneyclaw.data.indicators import bollinger, rsi
+from moneyclaw.execution.stock_signals import execute_stock_signal
 from moneyclaw.plugins.base import Opportunity, Result, Score, Strategy, load_strategy_config
+
+if TYPE_CHECKING:
+    from moneyclaw.execution.alpaca import AlpacaExecutor
 
 log = structlog.get_logger()
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "symbol": "AAPL",
-    "base_amount": 1000.0,
-    "max_position": 5000.0,
+    "base_amount": 10.0,
+    "max_position": 20.0,
     "min_profit_percent": 0.005,
     "max_loss_percent": 0.02,
     "rsi_period": 14,
@@ -39,18 +44,31 @@ class ApplTradingStrategy(Strategy):
     """RSI + Bollinger band swing signals on AAPL."""
 
     name = "appl_trading"
-    description = "APPL做T策略 - 监控苹果公司股票进行波段交易 (advisory)"
+    description = "APPL做T策略 - 监控苹果公司股票进行波段交易"
     risk_level = "medium"
     min_llm_layer = 3
 
-    def __init__(self, feed: StockFeed | None = None, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        feed: StockFeed | None = None,
+        stock_executor: AlpacaExecutor | None = None,
+        config: dict[str, Any] | None = None,
+    ):
         file_cfg = load_strategy_config(ApplTradingStrategy).get("parameters", {}) or {}
         self.config = {**DEFAULT_CONFIG, **file_cfg, **(config or {})}
         self._feed = feed or StockFeed()
+        self._executor = stock_executor
         self.paper_position = 0.0  # USD notionally held
         self.today_trades = 0
         self._trade_day = datetime.now(UTC).date()
         self.last_signal_time: datetime | None = None
+
+    def _held(self) -> float:
+        """USD currently held in the symbol (real/dry-run position, or paper)."""
+        if self._executor:
+            pos = self._executor.get_position(self.config["symbol"])
+            return pos.market_value if pos else 0.0
+        return self.paper_position
 
     def _roll_day(self) -> None:
         today = datetime.now(UTC).date()
@@ -77,41 +95,48 @@ class ApplTradingStrategy(Strategy):
 
         lower, mid, upper = bands
         price = closes[-1]
+        if self._executor:
+            self._executor.mark_price(cfg["symbol"], price)
+        held = self._held()
 
-        if self.paper_position < cfg["max_position"] and (
-            value < cfg["rsi_oversold"] or price <= lower
-        ):
+        if held < cfg["max_position"] and (value < cfg["rsi_oversold"] or price <= lower):
             side = "buy"
-            amount = min(cfg["base_amount"], cfg["max_position"] - self.paper_position)
+            amount = min(cfg["base_amount"], cfg["max_position"] - held)
             target = max(mid, price * (1 + cfg["min_profit_percent"]))
             stop = price * (1 - cfg["max_loss_percent"])
-        elif self.paper_position > 0 and (value > cfg["rsi_overbought"] or price >= upper):
+        elif held > 0 and (value > cfg["rsi_overbought"] or price >= upper):
             side = "sell"
-            amount = min(cfg["base_amount"], self.paper_position)
+            amount = held
             target = min(mid, price * (1 - cfg["min_profit_percent"]))
             stop = price * (1 + cfg["max_loss_percent"])
         else:
             return []
 
+        if side == "buy" and self._executor:
+            amount = min(amount, self._executor.max_buy_amount())
+        if side == "buy" and amount < 1.0:
+            return []  # No budget left — don't emit unexecutable signals
+
         self.last_signal_time = datetime.now(UTC)
-        return [
-            Opportunity(
-                strategy_name=self.name,
-                title=f"{cfg['symbol']} {side.upper()} @ {price:.2f} (RSI {value:.0f})",
-                money_involved=amount,
-                data={
-                    "symbol": cfg["symbol"],
-                    "signal_type": side,
-                    "price": price,
-                    "rsi": value,
-                    "bb_lower": lower,
-                    "bb_mid": mid,
-                    "bb_upper": upper,
-                    "target_price": target,
-                    "stop_loss": stop,
-                },
-            )
-        ]
+        opp = Opportunity(
+            strategy_name=self.name,
+            title=f"{cfg['symbol']} {side.upper()} @ {price:.2f} (RSI {value:.0f})",
+            money_involved=amount,
+            data={
+                "symbol": cfg["symbol"],
+                "signal_type": side,
+                "side": side,
+                "price": price,
+                "rsi": value,
+                "bb_lower": lower,
+                "bb_mid": mid,
+                "bb_upper": upper,
+                "target_price": target,
+                "stop_loss": stop,
+            },
+        )
+        opp.pre_score = (await self.evaluate(opp)).value
+        return [opp]
 
     async def evaluate(self, opp: Opportunity) -> Score:
         cfg = self.config
@@ -142,8 +167,13 @@ class ApplTradingStrategy(Strategy):
         )
 
     async def execute(self, opp: Opportunity) -> Result:
-        """Advisory: record the paper trade and surface the suggestion."""
+        """Trade via the stock executor if configured; otherwise advisory (paper position)."""
         side = opp.data.get("signal_type")
+        if self._executor:
+            result = await execute_stock_signal(self._executor, opp)
+            if result.success:
+                self.today_trades += 1
+            return result
         if side == "buy":
             self.paper_position += opp.money_involved
         elif side == "sell":

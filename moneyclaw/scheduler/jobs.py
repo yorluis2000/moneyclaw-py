@@ -29,10 +29,11 @@ def register_all_jobs(
     crypto_feed: CryptoFeed,
     storage: MarketStorage,
     settings: Settings,
+    collect_crypto: bool = True,
 ) -> None:
     """Register all scheduled jobs."""
 
-    # Daily risk reset at midnight UTC
+    # Daily risk reset at midnight UTC (counters only; limits changed via Telegram persist)
     async def risk_reset() -> None:
         risk.reset_daily()
         log.info("job.risk_reset")
@@ -47,11 +48,12 @@ def register_all_jobs(
                 storage.store_quotes([quote])
         log.info("job.crypto_prices_collected")
 
-    scheduler.add_interval(
-        "collect_crypto_prices",
-        collect_crypto_prices,
-        seconds=settings.data.price_poll_interval,
-    )
+    if collect_crypto:  # Skipped in stocks-only mode
+        scheduler.add_interval(
+            "collect_crypto_prices",
+            collect_crypto_prices,
+            seconds=settings.data.price_poll_interval,
+        )
 
     # Daily report at 21:00 UTC (send via Telegram)
     async def daily_report() -> None:

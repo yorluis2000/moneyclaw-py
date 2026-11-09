@@ -5,9 +5,12 @@ from __future__ import annotations
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Every settings section reads the project's .env file (not just process env vars).
+_ENV = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
 
 class TelegramSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="TELEGRAM_")
+    model_config = SettingsConfigDict(env_prefix="TELEGRAM_", **_ENV)
 
     token: str = ""
     chat_id: str = ""
@@ -54,11 +57,12 @@ class LLMSettings(BaseSettings):
 
 
 class RiskSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="RISK_")
+    model_config = SettingsConfigDict(env_prefix="RISK_", **_ENV)
 
-    max_trade_amount: float = 50.0  # Max single trade in USD
-    max_daily_loss: float = 100.0  # Stop-loss per day
-    approval_threshold: float = 50.0  # Require approval above this amount
+    max_trade_amount: float = 20.0  # Max single trade in USD
+    max_daily_loss: float = 20.0  # Stop trading after this much realized loss per day
+    approval_threshold: float = 15.0  # Trades at/above this need Telegram approval
+    max_portfolio_budget: float = 50.0  # Max USD deployed across all open stock positions
     cooldown_after_losses: int = 3  # Pause after N consecutive losses
     per_strategy_daily_loss: float = 30.0  # Per-strategy daily loss cap (0 = disabled)
     max_position_ratio: float = 0.5  # Max ratio of portfolio in single asset (0-1)
@@ -74,7 +78,7 @@ class ExchangeConfig(BaseSettings):
 
 
 class ExchangeSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="EXCHANGE_")
+    model_config = SettingsConfigDict(env_prefix="EXCHANGE_", **_ENV)
 
     # Default exchange for strategies that don't specify one
     default_exchange: str = "binance"
@@ -87,8 +91,18 @@ class ExchangeSettings(BaseSettings):
     okx_password: str = ""
 
 
+class AlpacaSettings(BaseSettings):
+    """Alpaca stock trading (trading + account/position reads only)."""
+
+    model_config = SettingsConfigDict(env_prefix="ALPACA_", **_ENV)
+
+    api_key: str = ""
+    secret_key: str = ""
+    paper: bool = True  # True → paper-api.alpaca.markets, False → real money
+
+
 class DataSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="DATA_")
+    model_config = SettingsConfigDict(env_prefix="DATA_", **_ENV)
 
     duckdb_path: str = "data/market.duckdb"
     price_poll_interval: int = 300  # 5 minutes
@@ -109,6 +123,7 @@ class Settings(BaseSettings):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     exchange: ExchangeSettings = Field(default_factory=ExchangeSettings)
+    alpaca: AlpacaSettings = Field(default_factory=AlpacaSettings)
     data: DataSettings = Field(default_factory=DataSettings)
 
     # General

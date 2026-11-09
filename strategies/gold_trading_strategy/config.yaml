@@ -5,9 +5,10 @@ min_llm_layer: 1
 enabled: true
 version_id: 23fd1ab398fa1064
 parameters:
-  min_amount: 1000.0
-  max_amount: 10000.0
-  position_ratio: 0.1
+  symbol: GLD
+  min_amount: 1.0
+  max_amount: 20.0
+  position_ratio: 0.5
   max_daily_trades: 5
   rsi_period: 14
   rsi_oversold: 30
