@@ -87,7 +87,7 @@ Each strategy has a `config.yaml` in its directory for customization.
 ## Stocks-Only Mode (Alpaca + Telegram)
 
 This fork runs as a stocks/ETF-only agent. Crypto strategies ship with `enabled: false`
-in their `config.yaml`; set it to `true` to bring one back.
+in their `config.yaml` and aren't loaded at all; set it to `true` to bring one back.
 
 **Active strategies:** `ai_longevity_growth` (NVDA, PLTR, AMD, AVGO, PATH, RXRX, ISRG,
 CRSP, NTLA, TEM, LLY), `gold_trading` (GLD), `appl_trading` (AAPL) and `stock_dividend`
@@ -97,6 +97,20 @@ CRSP, NTLA, TEM, LLY), `gold_trading` (GLD), `appl_trading` (AAPL) and `stock_di
 regular market hours. The executor can only call Alpaca's trading, position and
 account-read endpoints. Anything involving funding, ACH, bank links or transfers is refused
 in code before any request is made.
+
+**Zero-overcharge guards** (in `moneyclaw/execution/alpaca.py`):
+
+- **Cash only, never margin.** Before every buy the account is re-read. The order is
+  refused unless `non_marginable_buying_power` (settled cash) is *strictly greater* than
+  the order amount. If the account can't be read, or trading is blocked, nothing is bought.
+- **No short selling.** Sells use an exact share quantity, re-fetched from Alpaca right
+  before the order and never more than you hold. Anything that isn't a long position is
+  never sold. Notional sells and the liquidate-position endpoint aren't used.
+- **$0 LLM spend by default.** `DAILY_LLM_BUDGET=0.0` means paid LLM providers are never
+  discovered or called, even if their keys are set. Every stock strategy scores with rules
+  (Layer 0: RSI, Bollinger Bands, momentum), so trading never needs an LLM. A local Ollama
+  model is free and still allowed. Raise the budget to opt in to paid models; once the
+  day's budget is spent, only local models are used.
 
 **Risk limits** (defaults for a $50 budget, set in `.env`):
 
@@ -286,7 +300,7 @@ deploy:
 | `/reject <id>` | Reject a pending operation |
 | `/pause` | Pause all trading |
 | `/resume` | Resume trading |
-| `/positions` | Stock holdings, P&L, budget used |
+| `/positions` | Stock holdings, P&L, settled cash, budget used |
 | `/limits` | Current risk limits |
 | `/budget <usd>` | Set max total $ in open positions |
 | `/maxtrade <usd>` | Set max $ per trade |

@@ -12,8 +12,16 @@ Safety properties, enforced here regardless of what calls this class:
   still filling) above ``max_portfolio_budget`` — even if the account holds more.
   Limits are read live from the shared ``RiskSettings``, so Telegram changes apply
   immediately.
+* **Cash only, never margin.** Before every buy the account is re-read and the order
+  is refused unless ``non_marginable_buying_power`` (settled cash, excluding margin)
+  is strictly greater than the order amount. If the account can't be read, or
+  trading is blocked, the buy is refused (fail closed).
+* **No short selling.** Sells are quantity-based only. The held quantity is
+  re-fetched right before each sell and the order never exceeds it; anything that is
+  not a long position is refused. Notional sells and position liquidation endpoints
+  are not used.
 * **dry_run by default.** In dry-run mode nothing is sent to Alpaca; fills are
-  simulated at the caller's reference price and tracked in memory.
+  simulated at the caller's reference price against a simulated cash balance.
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -46,7 +55,6 @@ _ALLOWED_ENDPOINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("GET", re.compile(r"^/v2/assets/[A-Z.]{1,7}$")),
     ("GET", re.compile(r"^/v2/positions$")),
     ("GET", re.compile(r"^/v2/positions/[A-Z.]{1,7}$")),
-    ("DELETE", re.compile(r"^/v2/positions/[A-Z.]{1,7}$")),
     ("GET", re.compile(r"^/v2/orders$")),
     ("GET", re.compile(r"^/v2/orders/[A-Za-z0-9-]{1,64}$")),
     ("POST", re.compile(r"^/v2/orders$")),
@@ -55,10 +63,38 @@ _ALLOWED_ENDPOINTS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # Belt and braces: refuse anything mentioning money movement, even if it matched above.
 _FORBIDDEN_WORDS = ("transfer", "ach", "bank", "fund", "journal", "wire", "relationship")
 _ALLOWED_ORDER_KEYS = {"symbol", "side", "type", "time_in_force", "notional", "qty"}
+_QTY_STEP = Decimal("0.000000001")  # Alpaca supports up to 9 decimal places
+
+
+def _validate_order(body: dict[str, Any]) -> None:
+    """Only plain day market orders: buys by notional ($), sells by exact qty."""
+    extra = set(body) - _ALLOWED_ORDER_KEYS
+    if extra:
+        raise ForbiddenEndpointError(f"Order fields not allowed: {sorted(extra)}")
+    if body.get("type") != "market" or body.get("time_in_force") != "day":
+        raise ForbiddenEndpointError("Only day market orders are allowed")
+    side = body.get("side")
+    if side == "buy":
+        if "notional" not in body or "qty" in body:
+            raise ForbiddenEndpointError("Buys must be dollar-based (notional only)")
+    elif side == "sell":
+        if "qty" not in body or "notional" in body:
+            raise ForbiddenEndpointError("Sells must specify an exact share qty")
+        try:
+            if Decimal(str(body["qty"])) <= 0:
+                raise ForbiddenEndpointError("Sell qty must be positive")
+        except InvalidOperation as e:
+            raise ForbiddenEndpointError("Sell qty must be a number") from e
+    else:
+        raise ForbiddenEndpointError(f"Unknown order side {side!r}")
 
 
 class ForbiddenEndpointError(PermissionError):
     """Raised when code tries to call an Alpaca endpoint outside the trading allowlist."""
+
+
+class InsufficientCashError(RuntimeError):
+    """Raised when settled cash can't be confirmed for a buy."""
 
 
 @dataclass
@@ -88,6 +124,7 @@ class StockPosition:
     cost_basis: float
     market_value: float
     unrealized_pl: float
+    side: str = "long"
 
     @property
     def unrealized_plpc(self) -> float:
@@ -119,6 +156,7 @@ class AlpacaExecutor:
         self._in_flight: dict[str, float] = {}  # live buys not yet visible as positions
         self._orders: list[StockOrder] = []
         self._last_price: dict[str, float] = {}
+        self._sim_cash = float(settings.dry_run_cash)  # dry-run settled cash
 
         if not dry_run and not self.has_credentials:
             raise ValueError(
@@ -176,10 +214,8 @@ class AlpacaExecutor:
         ):
             log.error("alpaca.forbidden_endpoint", method=method, path=path)
             raise ForbiddenEndpointError(f"Alpaca endpoint not allowed: {method} {path}")
-        if json is not None and method == "POST":
-            extra = set(json) - _ALLOWED_ORDER_KEYS
-            if extra:
-                raise ForbiddenEndpointError(f"Order fields not allowed: {sorted(extra)}")
+        if method == "POST":
+            _validate_order(json or {})
         if not self.has_credentials:
             raise RuntimeError("Alpaca credentials are not configured")
 
@@ -206,15 +242,34 @@ class AlpacaExecutor:
         return _is_regular_session()
 
     async def get_account(self) -> dict[str, float]:
+        """Account summary. ``non_marginable_buying_power`` = settled cash usable for buys."""
         if self._dry_run:
+            value = sum(p.market_value for p in self._positions.values())
             return {
-                "equity": self._risk.max_portfolio_budget
-                + sum(p.unrealized_pl for p in self._positions.values()),
-                "cash": self.remaining_budget,
-                "buying_power": self.remaining_budget,
+                "equity": self._sim_cash + value,
+                "cash": self._sim_cash,
+                "buying_power": self._sim_cash,
+                "non_marginable_buying_power": self._sim_cash,
             }
         a = await self._request("GET", "/v2/account")
-        return {k: float(a.get(k) or 0) for k in ("equity", "cash", "buying_power")}
+        keys = ("equity", "cash", "buying_power", "non_marginable_buying_power")
+        return {k: float(a.get(k) or 0) for k in keys}
+
+    async def available_cash(self) -> float:
+        """Settled, non-margin cash available for buys. Raises if it can't be confirmed."""
+        if self._dry_run:
+            return self._sim_cash
+        try:
+            a = await self._request("GET", "/v2/account")
+        except Exception as e:
+            raise InsufficientCashError(f"could not read account: {e}") from e
+        for flag in ("trading_blocked", "account_blocked", "trade_suspended_by_user"):
+            if a.get(flag):
+                raise InsufficientCashError(f"account {flag.replace('_', ' ')}")
+        raw = a.get("non_marginable_buying_power")
+        if raw is None:
+            raise InsufficientCashError("account has no non_marginable_buying_power")
+        return float(raw)
 
     async def refresh(self) -> None:
         """Re-sync positions from Alpaca (live/paper). No-op in dry-run."""
@@ -234,6 +289,7 @@ class AlpacaExecutor:
                 cost_basis=float(r.get("cost_basis") or 0),
                 market_value=float(r.get("market_value") or 0),
                 unrealized_pl=float(r.get("unrealized_pl") or 0),
+                side=str(r.get("side") or "long"),
             )
             positions[p.symbol] = p
         # Buys that now show up as positions are no longer "in flight"
@@ -278,7 +334,7 @@ class AlpacaExecutor:
         )
 
     async def buy(self, symbol: str, notional: float, price: float | None = None) -> StockOrder:
-        """Dollar-based market buy. Enforces per-trade and total-budget caps."""
+        """Dollar-based market buy. Enforces per-trade/total-budget caps and cash-only."""
         symbol = symbol.upper()
         notional = round(float(notional), 2)
         if not _SYMBOL_RE.match(symbol):
@@ -302,6 +358,11 @@ class AlpacaExecutor:
         if self._dry_run:
             if not price:
                 return self._reject(symbol, "buy", notional, "no reference price for simulation")
+            if not self._sim_cash > notional:
+                return self._reject(
+                    symbol, "buy", notional, f"insufficient settled cash (${self._sim_cash:.2f})"
+                )
+            self._sim_cash -= notional
             qty = notional / price
             pos = self._positions.get(symbol)
             if pos:
@@ -338,6 +399,19 @@ class AlpacaExecutor:
                     reason="market closed",
                 )
             )
+        # Cash-only guard: settled, non-margin cash must exceed the order amount.
+        try:
+            cash = await self.available_cash()
+        except InsufficientCashError as e:
+            return self._reject(symbol, "buy", notional, f"cash check failed: {e}")
+        if not cash > notional:
+            return self._reject(
+                symbol,
+                "buy",
+                notional,
+                f"insufficient settled cash: non-marginable buying power ${cash:.2f}"
+                f" is not more than ${notional:.2f}",
+            )
         try:
             r = await self._request(
                 "POST",
@@ -370,19 +444,39 @@ class AlpacaExecutor:
         )
 
     async def close_position(self, symbol: str, price: float | None = None) -> StockOrder:
-        """Sell the entire position in ``symbol`` at market."""
+        """Sell exactly the shares currently held in ``symbol`` (never more)."""
+        return await self.sell(symbol, qty=None, price=price)
+
+    async def sell(
+        self, symbol: str, qty: float | None = None, price: float | None = None
+    ) -> StockOrder:
+        """Market-sell up to ``qty`` shares (default: the whole position).
+
+        Never sells more than is currently held, so it can't open a short position.
+        """
         symbol = symbol.upper()
         if not _SYMBOL_RE.match(symbol):
             return self._reject(symbol, "sell", 0.0, "invalid symbol")
+        if qty is not None and not qty > 0:
+            return self._reject(symbol, "sell", 0.0, "sell qty must be positive")
 
         if self._dry_run:
             pos = self._positions.get(symbol)
-            if not pos:
-                return self._reject(symbol, "sell", 0.0, "no open position")
+            if not pos or not pos.qty > 0:
+                return self._reject(symbol, "sell", 0.0, "no long position to sell")
+            sell_qty = pos.qty if qty is None else min(qty, pos.qty)
             price = price or self._last_price.get(symbol) or pos.avg_entry_price
-            proceeds = pos.qty * price
-            realized = proceeds - pos.cost_basis
-            del self._positions[symbol]
+            fraction = sell_qty / pos.qty
+            cost = pos.cost_basis * fraction
+            proceeds = sell_qty * price
+            if fraction >= 1 - 1e-12:
+                del self._positions[symbol]
+            else:
+                pos.qty -= sell_qty
+                pos.cost_basis -= cost
+                pos.market_value = pos.qty * price
+                pos.unrealized_pl = pos.market_value - pos.cost_basis
+            self._sim_cash += proceeds
             return self._record(
                 StockOrder(
                     id=f"dry_{uuid4().hex[:8]}",
@@ -391,43 +485,76 @@ class AlpacaExecutor:
                     notional=round(proceeds, 2),
                     status="filled",
                     dry_run=True,
-                    qty=pos.qty,
+                    qty=sell_qty,
                     filled_avg_price=price,
-                    realized_pl=round(realized, 2),
+                    realized_pl=round(proceeds - cost, 2),
                 )
             )
 
-        await self.refresh()
-        pos = self._positions.get(symbol)
-        if not pos:
-            return self._reject(symbol, "sell", 0.0, "no open position")
+        # Live: re-read this position right now, straight from Alpaca.
+        try:
+            r = await self._request("GET", f"/v2/positions/{symbol}")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                self._positions.pop(symbol, None)
+                return self._reject(symbol, "sell", 0.0, "no long position to sell")
+            return self._reject(symbol, "sell", 0.0, f"could not read position: {e}")
+        except Exception as e:
+            return self._reject(symbol, "sell", 0.0, f"could not read position: {e}")
+        try:
+            held = Decimal(str(r.get("qty") or "0"))
+        except InvalidOperation:
+            return self._reject(symbol, "sell", 0.0, "unreadable position qty")
+        if str(r.get("side") or "long") != "long" or held <= 0:
+            return self._reject(symbol, "sell", 0.0, "no long position to sell")
+
+        sell_qty = held
+        if qty is not None:
+            sell_qty = min(held, Decimal(str(qty)).quantize(_QTY_STEP, rounding=ROUND_DOWN))
+        if sell_qty <= 0:
+            return self._reject(symbol, "sell", 0.0, "sell qty rounds to zero")
+        fraction = float(sell_qty / held)
+        market_value = float(r.get("market_value") or 0) * fraction
+        unrealized = float(r.get("unrealized_pl") or 0) * fraction
+
         if not await self.is_market_open():
             return self._record(
                 StockOrder(
                     id=f"skip_{uuid4().hex[:8]}",
                     symbol=symbol,
                     side="sell",
-                    notional=pos.market_value,
+                    notional=round(market_value, 2),
                     status="skipped",
                     dry_run=False,
                     reason="market closed",
                 )
             )
         try:
-            r = await self._request("DELETE", f"/v2/positions/{symbol}")
+            o = await self._request(
+                "POST",
+                "/v2/orders",
+                json={
+                    "symbol": symbol,
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "qty": format(sell_qty.normalize(), "f"),
+                },
+            )
         except Exception as e:
             log.exception("alpaca.sell_failed", symbol=symbol)
-            return self._reject(symbol, "sell", pos.market_value, f"order failed: {e}")
-        del self._positions[symbol]
+            return self._reject(symbol, "sell", market_value, f"order failed: {e}")
+        if sell_qty == held:
+            self._positions.pop(symbol, None)
         return self._record(
             StockOrder(
-                id=str((r or {}).get("id", "")),
+                id=str((o or {}).get("id", "")),
                 symbol=symbol,
                 side="sell",
-                notional=round(pos.market_value, 2),
-                status=str((r or {}).get("status", "accepted")),
+                notional=round(market_value, 2),
+                status=str((o or {}).get("status", "accepted")),
                 dry_run=False,
-                qty=pos.qty,
-                realized_pl=round(pos.unrealized_pl, 2),  # P&L at time of exit (approx.)
+                qty=float(sell_qty),
+                realized_pl=round(unrealized, 2),  # P&L at time of exit (approx.)
             )
         )

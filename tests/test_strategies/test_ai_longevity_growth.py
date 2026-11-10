@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -197,3 +197,49 @@ class TestStocksOnlyDefaults:
         from strategies.gold_trading_strategy import GoldTradingStrategy
 
         assert GoldTradingStrategy().config["symbol"] == "GLD"
+
+
+class TestZeroLLM:
+    def test_layer_zero(self) -> None:
+        assert AiLongevityGrowth.min_llm_layer == 0
+
+    async def test_full_tick_with_no_llm_available(self) -> None:
+        """Scan → score → trade end to end while every LLM call fails."""
+        from moneyclaw.agent.brain import AgentBrain
+        from moneyclaw.agent.evaluator import Evaluator
+        from moneyclaw.execution.risk import RiskManager
+        from moneyclaw.plugins.registry import StrategyRegistry
+
+        ex = _executor()
+        s = _strategy({"NVDA": DIP_BOUNCE}, executor=ex, watchlist=["NVDA"])
+        registry = StrategyRegistry()
+        await registry.register(s)
+        llm = MagicMock()
+        llm.complete = AsyncMock(side_effect=RuntimeError("No suitable model available"))
+        memory = AsyncMock()
+        memory.get_approved = AsyncMock(return_value=[])
+        risk = RiskManager(ex._risk)
+        risk.set_exposure_provider(lambda: ex.deployed_capital)
+        brain = AgentBrain(
+            llm=llm,
+            memory=memory,
+            planner=MagicMock(),
+            evaluator=Evaluator(llm),
+            strategies=registry,
+            risk=risk,
+            scheduler=MagicMock(),
+            stock_executor=ex,
+        )
+        await brain._tick()
+        llm.complete.assert_not_called()
+        assert ex.get_position("NVDA") is not None
+
+
+class TestDividendRuleScored:
+    async def test_dividend_opportunities_are_pre_scored(self) -> None:
+        from strategies.stock_dividend import StockDividend
+
+        feed = StockFeed()
+        feed.get_info = AsyncMock(return_value={"name": "Verizon", "dividend_yield": 0.065})
+        opps = await StockDividend(feed=feed, watchlist=["VZ"]).scan()
+        assert opps and opps[0].pre_score is not None

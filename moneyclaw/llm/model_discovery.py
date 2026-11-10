@@ -78,6 +78,10 @@ PROVIDER_CONFIGS: dict[str, dict[str, Any]] = {
 }
 
 
+# Providers that run locally and never bill per token.
+LOCAL_PROVIDERS = frozenset({"ollama"})
+
+
 @dataclass
 class DiscoveryResult:
     """模型发现结果."""
@@ -95,10 +99,18 @@ class ModelDiscoveryService:
     并创建对应的ModelProfile。
     """
 
-    def __init__(self, timeout: float = 10.0, api_keys: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        timeout: float = 10.0,
+        api_keys: dict[str, str] | None = None,
+        local_only: bool = False,
+    ) -> None:
         self._timeout = timeout
         self._results: dict[str, DiscoveryResult] = {}
         self._api_keys = api_keys or {}
+        # $0 guard: only discover free local models (Ollama); never paid cloud APIs,
+        # even if their keys are present in the environment.
+        self._local_only = local_only
 
     async def discover_all(
         self,
@@ -116,6 +128,8 @@ class ModelDiscoveryService:
         tasks = []
 
         for provider, config in configs.items():
+            if self._local_only and provider not in LOCAL_PROVIDERS:
+                continue
             if self._should_discover(provider, config):
                 tasks.append(self._discover_provider(provider, config))
 

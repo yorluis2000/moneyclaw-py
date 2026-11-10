@@ -132,6 +132,14 @@ class TelegramBot:
             return f"Could not load positions: {e}"
         mode = "DRY RUN" if ex.dry_run else ("PAPER" if ex.paper else "LIVE")
         r = self._risk.status()
+        try:
+            acct = await ex.get_account()
+            cash_line = (
+                f"Cash available (settled, no margin): ${acct['non_marginable_buying_power']:.2f}"
+                f"\nAccount equity: ${acct['equity']:.2f}"
+            )
+        except Exception as e:
+            cash_line = f"Cash available: unavailable ({e})"
         if not positions:
             body = "No open positions."
         else:
@@ -147,6 +155,7 @@ class TelegramBot:
             body = "\n".join(lines)
         return (
             f"Positions [{mode}]\n\n{body}\n\n"
+            f"{cash_line}\n"
             f"Budget used: ${ex.deployed_capital:.2f} / ${r['max_portfolio_budget']:.2f}"
             f" (room ${ex.remaining_budget:.2f})\n"
             f"Realized loss today: ${r['daily_loss']:.2f} / ${r['daily_loss_limit']:.2f}"
@@ -292,15 +301,23 @@ class TelegramBot:
                 return
             from moneyclaw.llm.router import LLMLayer, TaskRequest
 
-            response = await self._llm.complete(
-                TaskRequest(
-                    prompt=args[1],
-                    system="You are MoneyClaw, a money-saving AI assistant. Be concise.",
-                    min_layer=LLMLayer.CHEAP,
-                    max_layer=LLMLayer.PREMIUM,
-                    complexity=0.5,
+            try:
+                response = await self._llm.complete(
+                    TaskRequest(
+                        prompt=args[1],
+                        system="You are MoneyClaw, a money-saving AI assistant. Be concise.",
+                        min_layer=LLMLayer.CHEAP,
+                        max_layer=LLMLayer.PREMIUM,
+                        complexity=0.5,
+                    )
                 )
-            )
+            except Exception:
+                log.info("telegram.ask_no_llm")
+                await message.answer(
+                    "No LLM available (DAILY_LLM_BUDGET=0 blocks paid models; run Ollama"
+                    " locally or raise the budget). Trading doesn't need it."
+                )
+                return
             await message.answer(response.text[:4000])  # Telegram message limit
 
         @dp.message(Command("strategy"))

@@ -61,22 +61,23 @@ class StockDividend(Strategy):
                 continue
 
             ex_date = info.get("ex_dividend_date")
-            opportunities.append(
-                Opportunity(
-                    strategy_name=self.name,
-                    title=f"Dividend: {ticker} yields {div_yield:.1%}",
-                    money_involved=0,  # Advisory only
-                    data={
-                        "ticker": ticker,
-                        "name": info.get("name", ""),
-                        "dividend_yield": div_yield,
-                        "pe_ratio": info.get("pe_ratio"),
-                        "market_cap": info.get("market_cap"),
-                        "ex_dividend_date": ex_date,
-                        "sector": info.get("sector", ""),
-                    },
-                )
+            opp = Opportunity(
+                strategy_name=self.name,
+                title=f"Dividend: {ticker} yields {div_yield:.1%}",
+                money_involved=0,  # Advisory only
+                data={
+                    "ticker": ticker,
+                    "name": info.get("name", ""),
+                    "dividend_yield": div_yield,
+                    "pe_ratio": info.get("pe_ratio"),
+                    "market_cap": info.get("market_cap"),
+                    "ex_dividend_date": ex_date,
+                    "sector": info.get("sector", ""),
+                },
             )
+            # Layer 0: rule-based score, so the agent never needs an LLM for this
+            opp.pre_score = (await self.evaluate(opp)).value
+            opportunities.append(opp)
 
         return opportunities
 

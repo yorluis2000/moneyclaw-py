@@ -74,6 +74,7 @@ async def _run(web: bool, telegram: bool) -> None:
     discovery = ModelDiscoveryService(
         timeout=settings.llm.llm_discovery_timeout,
         api_keys={k: v for k, v in api_keys.items() if v},  # 只传递非空的key
+        local_only=settings.llm.daily_llm_budget <= 0,  # $0 guard: no paid providers
     )
     registry = SmartModelRegistry(discovery_service=discovery)
     cost_tracker = CostTracker(daily_budget=settings.llm.daily_llm_budget)
@@ -173,6 +174,10 @@ async def _run(web: bool, telegram: bool) -> None:
     # Discover and register strategies — inject deps based on what they need
     strategy_classes = discover_strategies(settings.strategies_dir)
     for cls in strategy_classes:
+        # Skip strategies switched off in their config.yaml (crypto is off by default)
+        if load_strategy_config(cls).get("enabled", True) is False:
+            log.info("strategy.skipped_disabled", strategy=getattr(cls, "name", cls.__name__))
+            continue
         instance = _instantiate_strategy(
             cls,
             crypto_feed=crypto_feed,
@@ -182,9 +187,6 @@ async def _run(web: bool, telegram: bool) -> None:
             stock_executor=stock_executor,
         )
         await strategies.register(instance)
-        if load_strategy_config(cls).get("enabled", True) is False:
-            strategies.disable(instance.name)
-            log.info("strategy.disabled_by_config", strategy=instance.name)
 
     # --- Schedule jobs ---
     from moneyclaw.scheduler.jobs import register_all_jobs
@@ -247,8 +249,8 @@ async def _run(web: bool, telegram: bool) -> None:
 
     mode = "DRY RUN" if dry_run else ("ALPACA PAPER" if settings.alpaca.paper else "LIVE MONEY")
     click.echo(
-        f"MoneyClaw running [{mode}] — {len(strategies.active)}/{len(strategy_classes)}"
-        f" strategies active: {', '.join(s.name for s in strategies.active)}"
+        f"MoneyClaw running [{mode}] — {len(strategies.active)} strategies active:"
+        f" {', '.join(s.name for s in strategies.active)}"
     )
     r = settings.risk
     click.echo(
@@ -263,7 +265,10 @@ async def _run(web: bool, telegram: bool) -> None:
     if len(available_models) > 5:
         model_info.append(f"... and {len(available_models) - 5} more")
     click.echo(f"LLM models: {', '.join(model_info)}")
-    click.echo(f"Budget: ${settings.llm.daily_llm_budget:.2f}/day")
+    if settings.llm.daily_llm_budget <= 0:
+        click.echo("LLM budget: $0 — paid LLMs off; rule-based scoring + local Ollama only")
+    else:
+        click.echo(f"LLM budget: ${settings.llm.daily_llm_budget:.2f}/day")
 
     if web:
         click.echo(f"Dashboard: http://{settings.web_host}:{settings.web_port}")
@@ -404,6 +409,7 @@ async def _models() -> None:
     discovery = ModelDiscoveryService(
         timeout=settings.llm.llm_discovery_timeout,
         api_keys={k: v for k, v in api_keys.items() if v},
+        local_only=settings.llm.daily_llm_budget <= 0,  # $0 guard: no paid providers
     )
     registry = SmartModelRegistry(discovery_service=discovery)
 
@@ -504,6 +510,7 @@ async def _strategy_chat(message: str) -> None:
     discovery = ModelDiscoveryService(
         timeout=settings.llm.llm_discovery_timeout,
         api_keys={k: v for k, v in api_keys.items() if v},
+        local_only=settings.llm.daily_llm_budget <= 0,  # $0 guard: no paid providers
     )
     registry = SmartModelRegistry(discovery_service=discovery)
     cost_tracker = CostTracker(daily_budget=settings.llm.daily_llm_budget)

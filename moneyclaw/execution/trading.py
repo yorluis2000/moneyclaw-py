@@ -1,4 +1,9 @@
-"""Trading execution via ccxt — supports multiple exchanges with dry_run mode."""
+"""Trading execution — crypto via ccxt (TradeExecutor) and US stocks via Alpaca.
+
+Stock trading lives in :mod:`moneyclaw.execution.alpaca` and is re-exported here, so
+``from moneyclaw.execution.trading import AlpacaExecutor`` works alongside the ccxt
+executor.
+"""
 
 from __future__ import annotations
 
@@ -217,3 +222,24 @@ class TradeExecutor:
     @property
     def order_history(self) -> list[Order]:
         return list(self._orders)
+
+
+# --- US stocks/ETFs (Alpaca): cash-only, no shorting, budget-capped ---------------
+from moneyclaw.execution.alpaca import (  # noqa: E402
+    AlpacaExecutor,
+    ForbiddenEndpointError,
+    InsufficientCashError,
+    StockOrder,
+    StockPosition,
+)
+
+__all__ = [
+    "AlpacaExecutor",
+    "ExchangeManager",
+    "ForbiddenEndpointError",
+    "InsufficientCashError",
+    "Order",
+    "StockOrder",
+    "StockPosition",
+    "TradeExecutor",
+]

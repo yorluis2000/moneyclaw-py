@@ -136,3 +136,11 @@ class TestPollingResilience:
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         await bot.start()
         assert calls["n"] == 2 and sleeps == [5.0]
+
+
+class TestPositionsCash:
+    async def test_shows_settled_cash(self) -> None:
+        bot, _, ex = _bot()
+        await ex.buy("NVDA", 10, price=100)
+        text = await bot.positions_text()
+        assert "Cash available (settled, no margin): $90.00" in text

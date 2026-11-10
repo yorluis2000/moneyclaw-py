@@ -229,7 +229,11 @@ class SmartRouter:
         # 用户指定了模型
         if request.preferred_model:
             provider = self._providers.get(request.preferred_model)
-            if provider and provider.model_profile.is_available:
+            if (
+                provider
+                and provider.model_profile.is_available
+                and self._within_budget(provider.model_profile)
+            ):
                 return provider
             log.warning("smart_router.preferred_model_unavailable", model=request.preferred_model)
 
@@ -268,6 +272,14 @@ class SmartRouter:
 
         return best_provider
 
+    def _within_budget(self, model) -> bool:
+        """Paid (non-local) models need remaining daily budget; local ones are free."""
+        from moneyclaw.llm.model_discovery import LOCAL_PROVIDERS
+
+        if model.provider in LOCAL_PROVIDERS:
+            return True
+        return self._budget_manager.budget_remaining > 0
+
     def _filter_candidates(
         self,
         task_type: TaskType,
@@ -300,6 +312,12 @@ class SmartRouter:
                 continue
             if require_json_mode and not model.supports_json_mode:
                 log.info("smart_router.skip", reason="no_json", model=model.model_id)
+                continue
+
+            # $0 guard: with no budget left only local models may run. Cost estimates
+            # can't be trusted for this (unknown paid models are priced at $0).
+            if not self._within_budget(model):
+                log.info("smart_router.skip", reason="no_llm_budget", model=model.model_id)
                 continue
 
             # 成本检查

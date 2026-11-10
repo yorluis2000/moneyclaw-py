@@ -41,7 +41,9 @@ class LLMSettings(BaseSettings):
     moonshot_api_key: str = ""  # For Moonshot (月之暗面/Kimi)
 
     # Budget and routing configuration
-    daily_llm_budget: float = 5.0  # USD — daily spending limit
+    # USD/day for paid LLM APIs. 0 (default) = paid models are never discovered or
+    # called; strategies run on rule-based (Layer 0) scoring and local Ollama only.
+    daily_llm_budget: float = 0.0
     budget_caution_threshold: float = 0.6  # Enter caution mode at 60% usage
     budget_critical_threshold: float = 0.85  # Enter critical mode at 85% usage
     reserve_budget_for_urgent: float = 0.1  # Reserve 10% for urgent tasks
@@ -99,6 +101,7 @@ class AlpacaSettings(BaseSettings):
     api_key: str = ""
     secret_key: str = ""
     paper: bool = True  # True → paper-api.alpaca.markets, False → real money
+    dry_run_cash: float = 100.0  # simulated settled cash when EXCHANGE_DRY_RUN=true
 
 
 class DataSettings(BaseSettings):
